@@ -38,15 +38,43 @@ on:
         required: true
         default: "latest"
       ws_port:
-        description: "本地 WS 端口，必须等于 CF 隧道 Service URL 的端口"
+        description: "主端口（CF 隧道 Service URL 必须指向它；xhttp 模式也用它）"
         required: true
         default: "39201"
+      inbound_mode:
+        description: "入站协议：xhttp（推荐）| ws（老链路）| both"
+        type: choice
+        options:
+          - "xhttp"
+          - "ws"
+          - "both"
+        default: "xhttp"
+      xhttp_mode:
+        description: "服务端 XHTTP 模式（一般用 auto）"
+        type: choice
+        options:
+          - "auto"
+          - "packet-up"
+          - "stream-up"
+        default: "auto"
+      preferred:
+        description: "优选域名，逗号分隔；会为每个生成 H2/H3 链接（留空就不生成）"
+        required: false
+        default: "cf.877774.xyz,deepin.org,atc.ircf.space"
+      cf_protocol:
+        description: "cloudflared 到 CF 边缘的协议：http2（稳）| quic（UDP 出站，可能更快也可能不通）| auto"
+        type: choice
+        options:
+          - "http2"
+          - "quic"
+          - "auto"
+        default: "http2"
       mem:
         description: "内存"
         required: true
         default: "512MiB"
       vcpus:
-        description: "vCPU（Hobby 全账户 2，别和现有实例加起来超）"
+        description: "vCPU（Hobby 单台上限 1，填 2 会报 must be in the range 1 to 1）"
         required: true
         default: "1"
       fallback_port:
@@ -64,9 +92,13 @@ on:
           - "yes"
         default: "no"
       argo_domain:
-        description: "隧道域名（只用来在实例日志里打印链接，不参与连通）"
+        description: "隧道域名（打印链接用，不参与连通）"
         required: false
         default: "unik.lancewood.de5.net"
+      argo_xhttp_domain:
+        description: "仅 inbound_mode=both 且给 XHTTP 单独开了一条路由时填；留空=同 argo_domain"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -80,6 +112,7 @@ jobs:
       NODE_WS_PATH: ${{ secrets.NODE_WS_PATH }}
       NODE_XHTTP_PATH: ${{ secrets.NODE_XHTTP_PATH }}
       ARGO_DOMAIN: ${{ inputs.argo_domain }}
+      PREFERRED: ${{ inputs.preferred }}
     steps:
       - name: Install Unikraft CLI
         run: curl --proto '=https' --tlsv1.2 -fsSL https://unikraft.com/cli/install.sh | sh
@@ -122,6 +155,10 @@ jobs:
           case "${{ inputs.ws_port }}" in
             ''|*[!0-9]*) echo "::error::ws_port 必须是纯数字"; exit 1 ;;
           esac
+          case "${{ inputs.vcpus }}" in
+            1) ;;
+            *) echo "::error::Hobby 单台 vCPU 上限是 1，vcpus=${{ inputs.vcpus }} 会被 API 拒绝（Value of 'vcpus' must be in the range 1 to 1）"; exit 1 ;;
+          esac
 
       - name: Create instance (no public ingress)
         run: |
@@ -154,9 +191,13 @@ jobs:
             -e WS_PATH="$NODE_WS_PATH" \
             -e XHTTP_PATH="$NODE_XHTTP_PATH" \
             -e TUNNEL_TOKEN="$TUNNEL_TOKEN" \
-            -e CF_PROTOCOL=http2 \
+            -e CF_PROTOCOL="${{ inputs.cf_protocol }}" \
             -e WS_PORT="${{ inputs.ws_port }}" \
+            -e INBOUND_MODE="${{ inputs.inbound_mode }}" \
+            -e XHTTP_MODE="${{ inputs.xhttp_mode }}" \
             -e ARGO_DOMAIN="$ARGO_DOMAIN" \
+            -e ARGO_XHTTP_DOMAIN="${{ inputs.argo_xhttp_domain }}" \
+            -e PREFERRED="$PREFERRED" \
             | tee /tmp/run.log
 
           echo "=== 实例 ==="
@@ -172,7 +213,8 @@ jobs:
           下一步：
             1) CF 控制台 Networking → Tunnels，确认隧道变成 Healthy
             2) 确认隧道 Routes 的 Service URL 是 http://localhost:<ws_port>
-            3) Unikraft 控制台 → 这个实例 → Logs，搜 "#Unikraft-Argo-WS" 复制链接
-               （不要在公开的 Actions 日志里贴链接，里面有 UUID）
-            4) v2rayN 里 Ctrl+V 从剪贴板导入，测速
+               （inbound_mode=xhttp / both 时，它指向的就是 XHTTP 的监听端口）
+            3) Unikraft 控制台 → 这个实例 → Logs，搜 "Argo-XHTTP-H2" 或 "Argo-XHTTP-H3"
+               复制链接（不要在公开的 Actions 日志里贴，里面有 UUID）
+            4) v2rayN 里 Ctrl+V 导入；XHTTP 节点记得把 Mux 关掉
           EOF
