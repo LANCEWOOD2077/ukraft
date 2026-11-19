@@ -27,7 +27,10 @@ RUN apk add --no-cache curl unzip ca-certificates \
  && /usr/local/bin/cloudflared --version
 
 FROM alpine:latest
-RUN apk add --no-cache ca-certificates
+# darkhttpd：约 50KB 的静态文件服务器，用来提供 v2rayN 订阅文件（/www/<token>）。
+# busybox 的 httpd applet 在 Unikraft 的 base-compat 运行时里不可用，所以显式装一个。
+RUN apk add --no-cache ca-certificates \
+ && (apk add --no-cache darkhttpd || echo "警告：darkhttpd 装不上，订阅功能会不可用（代理不受影响）")
 COPY --from=fetch /usr/local/bin/xray /usr/local/bin/xray
 COPY --from=fetch /usr/local/bin/cloudflared /usr/local/bin/cloudflared
 COPY entrypoint.sh /entrypoint.sh
