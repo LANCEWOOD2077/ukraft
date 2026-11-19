@@ -177,28 +177,60 @@ jobs:
             echo "已挂 sandbox 插件：可用 unikraft instances exec/shell 进实例"
           fi
 
-          unikraft run \
-            --metro "${{ inputs.metro }}" \
-            --image "${{ steps.login.outputs.org }}/${{ steps.login.outputs.repo }}:${{ inputs.tag }}" \
-            -n "${{ inputs.name }}" \
-            -m "${{ inputs.mem }}" --vcpus "${{ inputs.vcpus }}" \
-            ${PORTS[@]+"${PORTS[@]}"} \
-            ${PLUGINS[@]+"${PLUGINS[@]}"} \
-            --scale-to-zero policy=off \
-            --restart always \
-            --autostart \
-            -e UUID="$NODE_UUID" \
-            -e WS_PATH="$NODE_WS_PATH" \
-            -e XHTTP_PATH="$NODE_XHTTP_PATH" \
-            -e TUNNEL_TOKEN="$TUNNEL_TOKEN" \
-            -e CF_PROTOCOL="${{ inputs.cf_protocol }}" \
-            -e WS_PORT="${{ inputs.ws_port }}" \
-            -e INBOUND_MODE="${{ inputs.inbound_mode }}" \
-            -e XHTTP_MODE="${{ inputs.xhttp_mode }}" \
-            -e ARGO_DOMAIN="$ARGO_DOMAIN" \
-            -e ARGO_XHTTP_DOMAIN="${{ inputs.argo_xhttp_domain }}" \
-            -e PREFERRED="$PREFERRED" \
-            | tee /tmp/run.log
+          created=0
+          for attempt in 1 2 3 4; do
+            echo "::group::unikraft run（第 $attempt 次）"
+            set +e
+            unikraft run \
+              --metro "${{ inputs.metro }}" \
+              --image "${{ steps.login.outputs.org }}/${{ steps.login.outputs.repo }}:${{ inputs.tag }}" \
+              -n "${{ inputs.name }}" \
+              -m "${{ inputs.mem }}" --vcpus "${{ inputs.vcpus }}" \
+              ${PORTS[@]+"${PORTS[@]}"} \
+              ${PLUGINS[@]+"${PLUGINS[@]}"} \
+              --scale-to-zero policy=off \
+              --restart always \
+              --autostart \
+              -e UUID="$NODE_UUID" \
+              -e WS_PATH="$NODE_WS_PATH" \
+              -e XHTTP_PATH="$NODE_XHTTP_PATH" \
+              -e TUNNEL_TOKEN="$TUNNEL_TOKEN" \
+              -e CF_PROTOCOL="${{ inputs.cf_protocol }}" \
+              -e WS_PORT="${{ inputs.ws_port }}" \
+              -e INBOUND_MODE="${{ inputs.inbound_mode }}" \
+              -e XHTTP_MODE="${{ inputs.xhttp_mode }}" \
+              -e ARGO_DOMAIN="$ARGO_DOMAIN" \
+              -e ARGO_XHTTP_DOMAIN="${{ inputs.argo_xhttp_domain }}" \
+              -e PREFERRED="$PREFERRED" \
+              | tee /tmp/run.log
+            rc=${PIPESTATUS[0]}
+            set -e
+            echo "::endgroup::"
+
+            if [ "$rc" -eq 0 ]; then created=1; break; fi
+
+            # 502 / TLS timeout 可能发生在实例「已经建好之后」，先确认再决定重不重试，
+            # 否则重试只会撞 already exists。
+            if unikraft instances list 2>/dev/null | grep -qw "${{ inputs.name }}"; then
+              echo "实例 ${{ inputs.name }} 已经存在 —— 上一次请求其实创建成功了，按成功处理"
+              created=1
+              break
+            fi
+
+            echo "第 $attempt 次失败（exit=$rc），日志末尾："
+            tail -n 8 /tmp/run.log || true
+
+            if [ "$attempt" -lt 4 ]; then
+              wait_s=$((attempt * 20))
+              echo "大多数情况是 Unikraft 控制面抖动（502 / TLS handshake timeout），${wait_s}s 后重试…"
+              sleep "$wait_s"
+            fi
+          done
+
+          if [ "$created" -ne 1 ]; then
+            echo "::error::创建失败：重试 4 次都没成功。先去 https://status.unikraft.cloud 确认是不是平台故障，恢复后再点一次 Run workflow（实例没建出来，名字不会占用）。"
+            exit 1
+          fi
 
           echo "=== 实例 ==="
           grep -E 'name:|state:|fqdn:' /tmp/run.log || true
