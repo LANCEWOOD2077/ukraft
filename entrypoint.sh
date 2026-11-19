@@ -2,56 +2,101 @@
 # 容器启动时用环境变量生成 xray 配置，再启动 xray；有 TUNNEL_TOKEN 时同时拉起 cloudflared。
 #
 # 必填：UUID
-# 可选：WS_PATH / XHTTP_PATH / DOMAIN / ARGO_DOMAIN
-#       TUNNEL_TOKEN   Cloudflare Tunnel 的 token；不填就只跑直连，行为和 v2 完全一样
-#       CF_PROTOCOL    cloudflared 到 Cloudflare 边缘的协议：http2（默认，稳）| quic | auto
+# 可选：
+#   WS_PATH / XHTTP_PATH      入站路径
+#   INBOUND_MODE              ws | xhttp | both（默认 both）
+#                               ws    只有 VLESS+WS，监听 WS_PORT
+#                               xhttp 只有 VLESS+XHTTP，监听 WS_PORT（CF 路由不用改）
+#                               both  WS=WS_PORT + XHTTP=XHTTP_PORT（兼容老的直连 workflow）
+#   WS_PORT                   主端口，CF 隧道 Service URL 必须指向它（默认 8080）
+#   XHTTP_PORT                仅 both 时用到，XHTTP 端口（默认 8081）
+#   XHTTP_MODE                服务端 xhttp 模式：auto（默认）| packet-up | stream-up
+#   TUNNEL_TOKEN              Cloudflare Tunnel token；不填就只跑直连
+#   CF_PROTOCOL               cloudflared -> CF 边缘：http2（默认）| quic | auto
+#   ARGO_DOMAIN               WS 的隧道域名，用来打印链接
+#   ARGO_XHTTP_DOMAIN         XHTTP 的隧道域名；不填就用 ARGO_DOMAIN
+#   PREFERRED                 逗号分隔的优选域名/IP，会为每个生成 H2/H3 链接
+#   DOMAIN                    直连域名（老的直连部署才需要）
 #
-# 端口：${WS_PORT:-8080} = VLESS+WS（主用，Argo 也回源到这里），8081 = VLESS+XHTTP（备用）。
-# 平台在外层终结 TLS 再以明文 HTTP 转进来，所以两个入站都不开 TLS、不放证书。
+# 平台在外层终结 TLS 再以明文 HTTP 转进来，所以所有入站都不开 TLS、不放证书。
 set -eu
 
 UUID="${UUID:?必须设置 UUID 环境变量}"
 WS_PATH="${WS_PATH:-/ws}"
 XHTTP_PATH="${XHTTP_PATH:-/xhttp}"
-# 本地 WS 端口。CF 隧道里那条 Public hostname 的 Service URL 必须指向它
-# （例如 Service URL = http://localhost:39201 就设 WS_PORT=39201）。
 WS_PORT="${WS_PORT:-8080}"
+XHTTP_PORT="${XHTTP_PORT:-8081}"
+INBOUND_MODE="${INBOUND_MODE:-both}"
+XHTTP_MODE="${XHTTP_MODE:-auto}"
 CF_PROTOCOL="${CF_PROTOCOL:-http2}"
+DOMAIN="${DOMAIN:-}"
+ARGO_DOMAIN="${ARGO_DOMAIN:-}"
+ARGO_XHTTP_DOMAIN_EXPLICIT="${ARGO_XHTTP_DOMAIN:-}"
+ARGO_XHTTP_DOMAIN="${ARGO_XHTTP_DOMAIN:-}"
+PREFERRED="${PREFERRED:-}"
+
+case "$INBOUND_MODE" in
+  ws|xhttp|both) ;;
+  *) echo "[entrypoint] INBOUND_MODE 只能是 ws / xhttp / both，收到：$INBOUND_MODE"; exit 1 ;;
+esac
+
+# 端口分配：xhttp 单选时复用 WS_PORT，这样 CF 那条 route 一个字都不用改
+case "$INBOUND_MODE" in
+  ws)    WS_ON="$WS_PORT";     XHTTP_ON="" ;;
+  xhttp) WS_ON="";             XHTTP_ON="$WS_PORT" ;;
+  both)  WS_ON="$WS_PORT";     XHTTP_ON="$XHTTP_PORT" ;;
+esac
+
+[ -n "$ARGO_XHTTP_DOMAIN" ] || ARGO_XHTTP_DOMAIN="$ARGO_DOMAIN"
 
 mkdir -p /etc/xray
-# 相比 v2 只改了两处：
-#   1) 去掉 sniffing：没有分流规则时它纯属额外解析，白吃 CPU；这里全部走 freedom，不需要。
+
+# 入站 JSON。相比最早那版：
+#   1) 去掉 sniffing：没有分流规则时它纯属额外解析，白吃 CPU。
 #   2) freedom 加 sockopt keepalive：经 CF / 网关的长连接不容易被中间设备静默掐掉。
+INBOUNDS=""
+if [ -n "$WS_ON" ]; then
+  INBOUNDS="{
+      \"port\": ${WS_ON},
+      \"listen\": \"0.0.0.0\",
+      \"protocol\": \"vless\",
+      \"settings\": {
+        \"clients\": [ { \"id\": \"${UUID}\" } ],
+        \"decryption\": \"none\"
+      },
+      \"streamSettings\": {
+        \"network\": \"ws\",
+        \"wsSettings\": { \"path\": \"${WS_PATH}\" }
+      }
+    }"
+fi
+
+if [ -n "$XHTTP_ON" ]; then
+  if [ -n "$INBOUNDS" ]; then INBOUNDS="${INBOUNDS},"; fi
+  INBOUNDS="${INBOUNDS}
+    {
+      \"port\": ${XHTTP_ON},
+      \"listen\": \"0.0.0.0\",
+      \"protocol\": \"vless\",
+      \"settings\": {
+        \"clients\": [ { \"id\": \"${UUID}\" } ],
+        \"decryption\": \"none\"
+      },
+      \"streamSettings\": {
+        \"network\": \"xhttp\",
+        \"xhttpSettings\": {
+          \"path\": \"${XHTTP_PATH}\",
+          \"mode\": \"${XHTTP_MODE}\"
+        }
+      }
+    }"
+fi
+
 cat > /etc/xray/config.json <<EOF
 {
   "log": { "loglevel": "warning" },
   "inbounds": [
-    {
-      "port": ${WS_PORT},
-      "listen": "0.0.0.0",
-      "protocol": "vless",
-      "settings": {
-        "clients": [ { "id": "${UUID}" } ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "ws",
-        "wsSettings": { "path": "${WS_PATH}" }
-      }
-    },
-    {
-      "port": 8081,
-      "listen": "0.0.0.0",
-      "protocol": "vless",
-      "settings": {
-        "clients": [ { "id": "${UUID}" } ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "xhttp",
-        "xhttpSettings": { "path": "${XHTTP_PATH}", "mode": "auto" }
-      }
-    }
+    ${INBOUNDS}
   ],
   "outbounds": [
     {
@@ -69,12 +114,12 @@ cat > /etc/xray/config.json <<EOF
 }
 EOF
 
-echo "[entrypoint] xray: ${WS_PORT} ws ${WS_PATH} / 8081 xhttp ${XHTTP_PATH}"
+echo "[entrypoint] inbound=${INBOUND_MODE} ws=${WS_ON:-off}${WS_PATH} xhttp=${XHTTP_ON:-off}${XHTTP_PATH} (server mode=${XHTTP_MODE})"
 
 # ---- 可选：Cloudflare Tunnel（Argo）----
 CF_PID=""
 if [ -n "${TUNNEL_TOKEN:-}" ]; then
-  echo "[entrypoint] cloudflared 启动：protocol=${CF_PROTOCOL} -> http://127.0.0.1:${WS_PORT}"
+  echo "[entrypoint] cloudflared 启动：protocol=${CF_PROTOCOL}（回源地址由 CF route 决定）"
   cloudflared tunnel --no-autoupdate --protocol "$CF_PROTOCOL" --loglevel info \
     run --token "$TUNNEL_TOKEN" &
   CF_PID=$!
@@ -82,16 +127,40 @@ else
   echo "[entrypoint] 未设置 TUNNEL_TOKEN，仅直连模式"
 fi
 
-# 日志里打印链接，方便在控制台 Logs 页直接复制
-if [ -n "${DOMAIN:-}" ]; then
-  _ws="${WS_PATH#/}"
-  _xhttp="${XHTTP_PATH#/}"
-  echo "[entrypoint] vless://${UUID}@${DOMAIN}:443?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=ws&host=${DOMAIN}&path=%2F${_ws}#Unikraft-WS-Direct"
-  echo "[entrypoint] vless://${UUID}@${DOMAIN}:8443?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=xhttp&host=${DOMAIN}&path=%2F${_xhttp}&mode=packet-up#Unikraft-XHTTP-Direct"
+# ---- 打印链接，方便在控制台 Logs 页直接复制 ----
+_ws="${WS_PATH#/}"
+_xp="${XHTTP_PATH#/}"
+
+# xhttp 链接：地址、alpn、tag
+xp_link() {
+  printf '[entrypoint] vless://%s@%s:443?encryption=none&security=tls&sni=%s&alpn=%s&fp=chrome&type=xhttp&mode=auto&host=%s&path=%%2F%s#%s\n' \
+    "$UUID" "$1" "$ARGO_XHTTP_DOMAIN" "$2" "$ARGO_XHTTP_DOMAIN" "$_xp" "$3"
+}
+
+if [ -n "$DOMAIN" ]; then
+  if [ -n "$WS_ON" ]; then
+    echo "[entrypoint] vless://${UUID}@${DOMAIN}:443?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=ws&host=${DOMAIN}&path=%2F${_ws}#Unikraft-WS-Direct"
+  fi
+  if [ -n "$XHTTP_ON" ]; then
+    echo "[entrypoint] vless://${UUID}@${DOMAIN}:8443?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=xhttp&host=${DOMAIN}&path=%2F${_xp}&mode=packet-up#Unikraft-XHTTP-Direct"
+  fi
 fi
-if [ -n "${ARGO_DOMAIN:-}" ]; then
-  _ws="${WS_PATH#/}"
+
+if [ -n "$ARGO_DOMAIN" ] && [ -n "$WS_ON" ]; then
   echo "[entrypoint] vless://${UUID}@${ARGO_DOMAIN}:443?encryption=none&security=tls&sni=${ARGO_DOMAIN}&fp=chrome&type=ws&host=${ARGO_DOMAIN}&path=%2F${_ws}#Unikraft-Argo-WS"
+fi
+
+if [ -n "$ARGO_XHTTP_DOMAIN" ] && [ -n "$XHTTP_ON" ] \
+   && { [ "$INBOUND_MODE" = "xhttp" ] || [ -n "$ARGO_XHTTP_DOMAIN_EXPLICIT" ]; }; then
+  xp_link "$ARGO_XHTTP_DOMAIN" h2 "Argo-XHTTP-H2"
+  xp_link "$ARGO_XHTTP_DOMAIN" h3 "Argo-XHTTP-H3"
+  for p in $(echo "$PREFERRED" | tr ',' ' '); do
+    [ -n "$p" ] || continue
+    t2=$(printf 'Argo-H2 %s' "$p" | sed 's/ /%20/g')
+    t3=$(printf 'Argo-H3 %s' "$p" | sed 's/ /%20/g')
+    xp_link "$p" h2 "$t2"
+    xp_link "$p" h3 "$t3"
+  done
 fi
 
 xray run -c /etc/xray/config.json &
