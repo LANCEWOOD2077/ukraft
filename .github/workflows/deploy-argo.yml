@@ -1,0 +1,178 @@
+# 一键创建 Argo(Cloudflare Tunnel) 节点实例：无公网入站，只走出站。
+#
+# 前置（只做一次）：
+#   1. 仓库 Settings → Secrets and variables → Actions 里已有：
+#        UKC_TOKEN         Unikraft API token（打镜像那个）
+#        NODE_UUID         节点 UUID
+#        NODE_WS_PATH      WS 路径，例如 /5XFz1t1M
+#        NODE_XHTTP_PATH   XHTTP 路径，例如 /mtMZdoBI
+#   2. 再加一个秘密：
+#        TUNNEL_TOKEN      Cloudflare 隧道 token（控制台建隧道时给的 eyJhIjoi...）
+#      注意：这是密钥，只放 Secrets，绝不写进 workflow 或代码。
+#
+# 用法：Actions → Deploy Argo instance → Run workflow
+#   ws_port 必须和 CF 隧道里 Public hostname 的 Service URL 端口一致
+#   （Service URL = http://localhost:39201 就填 39201）
+#
+# 本 workflow 故意不打印节点链接（公开仓库的 Actions 日志谁都能看）。
+# 链接在 Unikraft 控制台 → 实例 → Logs 里，搜 "#Unikraft-Argo-WS"。
+name: Deploy Argo instance
+
+on:
+  workflow_dispatch:
+    inputs:
+      metro:
+        description: "机房：sin / sfo / was / fra / dal"
+        required: true
+        default: "sin"
+      org:
+        description: "Unikraft 组织名（留空自动识别）"
+        required: false
+        default: ""
+      name:
+        description: "实例名（同一机房下唯一）"
+        required: true
+        default: "xray-argo"
+      tag:
+        description: "镜像标签"
+        required: true
+        default: "latest"
+      ws_port:
+        description: "本地 WS 端口，必须等于 CF 隧道 Service URL 的端口"
+        required: true
+        default: "39201"
+      mem:
+        description: "内存"
+        required: true
+        default: "512MiB"
+      vcpus:
+        description: "vCPU（Hobby 全账户 2，别和现有实例加起来超）"
+        required: true
+        default: "1"
+      fallback_port:
+        description: "是否额外开放 8443 直连备用（no 就是纯 Argo，零公网入站）"
+        type: choice
+        options:
+          - "no"
+          - "yes"
+        default: "no"
+      sandbox_plugin:
+        description: "是否挂 sandbox 插件（挂上就能 exec/shell 进实例；代理节点保持纯净就选 no）"
+        type: choice
+        options:
+          - "no"
+          - "yes"
+        default: "no"
+      argo_domain:
+        description: "隧道域名（只用来在实例日志里打印链接，不参与连通）"
+        required: false
+        default: "unik.lancewood.de5.net"
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
+      NODE_UUID: ${{ secrets.NODE_UUID }}
+      NODE_WS_PATH: ${{ secrets.NODE_WS_PATH }}
+      NODE_XHTTP_PATH: ${{ secrets.NODE_XHTTP_PATH }}
+      ARGO_DOMAIN: ${{ inputs.argo_domain }}
+    steps:
+      - name: Install Unikraft CLI
+        run: curl --proto '=https' --tlsv1.2 -fsSL https://unikraft.com/cli/install.sh | sh
+
+      - name: Log in and detect organization
+        id: login
+        run: |
+          trap 'rm -f /tmp/ukc-token' EXIT
+          printf '%s' "${{ secrets.UKC_TOKEN }}" > /tmp/ukc-token
+          chmod 600 /tmp/ukc-token
+          ok=0
+          for i in 1 2 3; do
+            if unikraft login --token /tmp/ukc-token; then ok=1; break; fi
+            echo "登录失败，10 秒后重试（第 $i/3 次）…"
+            sleep 10
+          done
+          test "$ok" = 1
+          ORG=$(awk '/^[[:space:]]*organization:/ {print $2; exit}' ~/.config/unikraft/config.yaml | tr -d '"')
+          if [ -z "$ORG" ]; then ORG="${{ inputs.org }}"; fi
+          if [ -z "$ORG" ]; then
+            echo "::error::无法自动识别组织，请在仓库 Secret 里确认 UKC_TOKEN 可用"
+            exit 1
+          fi
+          unikraft login --token /tmp/ukc-token --organization "$ORG"
+          echo "org=$ORG" >> "$GITHUB_OUTPUT"
+          REPO="${GITHUB_REPOSITORY##*/}"
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+          echo "镜像：$ORG/$REPO:${{ inputs.tag }}"
+
+      - name: Check secrets
+        run: |
+          missing=""
+          for v in TUNNEL_TOKEN NODE_UUID NODE_WS_PATH NODE_XHTTP_PATH; do
+            if [ -z "${!v}" ]; then missing="$missing $v"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::这些秘密还没加：$missing（Settings → Secrets and variables → Actions）"
+            exit 1
+          fi
+          case "${{ inputs.ws_port }}" in
+            ''|*[!0-9]*) echo "::error::ws_port 必须是纯数字"; exit 1 ;;
+          esac
+
+      - name: Create instance (no public ingress)
+        run: |
+          set -o pipefail
+          PORTS=()
+          if [ "${{ inputs.fallback_port }}" = "yes" ]; then
+            PORTS=(-p 8443:8081/tls)
+            echo "额外开放 8443 直连备用"
+          else
+            echo "纯 Argo：不开任何公网端口"
+          fi
+
+          PLUGINS=()
+          if [ "${{ inputs.sandbox_plugin }}" = "yes" ]; then
+            PLUGINS=(--plugin 'name=sandbox,image=plugins/sandbox:latest')
+            echo "已挂 sandbox 插件：可用 unikraft instances exec/shell 进实例"
+          fi
+
+          unikraft run \
+            --metro "${{ inputs.metro }}" \
+            --image "${{ steps.login.outputs.org }}/${{ steps.login.outputs.repo }}:${{ inputs.tag }}" \
+            -n "${{ inputs.name }}" \
+            -m "${{ inputs.mem }}" --vcpus "${{ inputs.vcpus }}" \
+            ${PORTS[@]+"${PORTS[@]}"} \
+            ${PLUGINS[@]+"${PLUGINS[@]}"} \
+            --scale-to-zero policy=off \
+            --restart always \
+            --autostart \
+            -e UUID="$NODE_UUID" \
+            -e WS_PATH="$NODE_WS_PATH" \
+            -e XHTTP_PATH="$NODE_XHTTP_PATH" \
+            -e TUNNEL_TOKEN="$TUNNEL_TOKEN" \
+            -e CF_PROTOCOL=http2 \
+            -e WS_PORT="${{ inputs.ws_port }}" \
+            -e ARGO_DOMAIN="$ARGO_DOMAIN" \
+            | tee /tmp/run.log
+
+          echo "=== 实例 ==="
+          grep -E 'name:|state:|fqdn:' /tmp/run.log || true
+
+      # 只显示状态，不打印环境变量（里面有 token）
+      - name: Show instances
+        run: unikraft instances list || true
+
+      - name: Done
+        run: |
+          cat <<'EOF'
+          下一步：
+            1) CF 控制台 Networking → Tunnels，确认隧道变成 Healthy
+            2) 确认隧道 Routes 的 Service URL 是 http://localhost:<ws_port>
+            3) Unikraft 控制台 → 这个实例 → Logs，搜 "#Unikraft-Argo-WS" 复制链接
+               （不要在公开的 Actions 日志里贴链接，里面有 UUID）
+            4) v2rayN 里 Ctrl+V 从剪贴板导入，测速
+          EOF
