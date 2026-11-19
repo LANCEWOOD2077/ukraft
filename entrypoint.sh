@@ -120,7 +120,9 @@ cat > /etc/xray/config.json <<EOF
 }
 EOF
 
-echo "[entrypoint] inbound=${INBOUND_MODE} ws=${WS_ON:-off}${WS_PATH} xhttp=${XHTTP_ON:-off}${XHTTP_PATH} (server mode=${XHTTP_MODE})"
+if [ -n "$WS_ON" ]; then _wsinfo="${WS_ON}${WS_PATH}"; else _wsinfo="off"; fi
+if [ -n "$XHTTP_ON" ]; then _xinfo="${XHTTP_ON}${XHTTP_PATH}"; else _xinfo="off"; fi
+echo "[entrypoint] inbound=${INBOUND_MODE} ws=${_wsinfo} xhttp=${_xinfo} (server mode=${XHTTP_MODE})"
 
 # ---- 可选：Cloudflare Tunnel（Argo）----
 CF_PID=""
@@ -192,20 +194,26 @@ if [ -n "$SUB_PORT" ] && [ -n "$LINKS" ]; then
   # v2rayN 认 base64（换行分隔的链接列表），不加换行的 base64 最稳
   printf '%s\n' "$LINKS" | base64 | tr -d '\r\n' > "/www/${SUB_TOKEN}"
   chmod 644 "/www/${SUB_TOKEN}"
-  busybox httpd -f -p "$SUB_PORT" -h /www 2>/dev/null &
-  HTTPD_PID=$!
-  sleep 1
-  if kill -0 "$HTTPD_PID" 2>/dev/null; then
-    echo "[entrypoint] 订阅已启用：http://127.0.0.1:${SUB_PORT}/${SUB_TOKEN}（共 $(printf '%s\n' "$LINKS" | wc -l) 条）"
-    if [ -n "$SUB_DOMAIN" ]; then
-      echo "[entrypoint] 订阅地址： https://${SUB_DOMAIN}/${SUB_TOKEN}"
-    fi
-    if [ -n "$TUNNEL_TOKEN" ]; then
-      echo "[entrypoint] 记得在 CF 隧道里加一条路由：${SUB_DOMAIN:-<订阅域名>} -> http://localhost:${SUB_PORT}"
+
+  if ! busybox --list 2>/dev/null | grep -qx httpd; then
+    echo "[entrypoint] 这个镜像的 busybox 没有 httpd applet，订阅跳过（不影响代理）"
+  elif busybox httpd -p "$SUB_PORT" -h /www 2>/tmp/httpd.err; then
+    sleep 1
+    if busybox wget -q -O /dev/null "http://127.0.0.1:${SUB_PORT}/${SUB_TOKEN}" 2>/dev/null; then
+      echo "[entrypoint] 订阅已启用：http://127.0.0.1:${SUB_PORT}/${SUB_TOKEN}（共 $(printf '%s\n' "$LINKS" | wc -l) 条）"
+      if [ -n "$SUB_DOMAIN" ]; then
+        echo "[entrypoint] 订阅地址： https://${SUB_DOMAIN}/${SUB_TOKEN}"
+      fi
+      if [ -n "$TUNNEL_TOKEN" ]; then
+        echo "[entrypoint] 记得在 CF 隧道里加一条路由：${SUB_DOMAIN:-<订阅域名>} -> http://localhost:${SUB_PORT}"
+      fi
+    else
+      echo "[entrypoint] 警告：httpd 起来了但自检不通，订阅可能不可用"
+      cat /tmp/httpd.err 2>/dev/null || true
     fi
   else
-    echo "[entrypoint] 警告：busybox httpd 没起来，订阅不可用（不影响代理）"
-    HTTPD_PID=""
+    echo "[entrypoint] 警告：busybox httpd 启动失败，订阅不可用（不影响代理）"
+    cat /tmp/httpd.err 2>/dev/null || true
   fi
 fi
 
