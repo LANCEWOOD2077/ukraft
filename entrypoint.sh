@@ -195,11 +195,13 @@ if [ -n "$SUB_PORT" ] && [ -n "$LINKS" ]; then
   printf '%s\n' "$LINKS" | base64 | tr -d '\r\n' > "/www/${SUB_TOKEN}"
   chmod 644 "/www/${SUB_TOKEN}"
 
-  if ! busybox --list 2>/dev/null | grep -qx httpd; then
-    echo "[entrypoint] 这个镜像的 busybox 没有 httpd applet，订阅跳过（不影响代理）"
-  elif busybox httpd -p "$SUB_PORT" -h /www 2>/tmp/httpd.err; then
+  if ! command -v darkhttpd >/dev/null 2>&1; then
+    echo "[entrypoint] 镜像里没有 darkhttpd，订阅跳过（需要重新打镜像；不影响代理）"
+  else
+    darkhttpd /www --port "$SUB_PORT" >/tmp/httpd.log 2>&1 &
+    HTTPD_PID=$!
     sleep 1
-    if busybox wget -q -O /dev/null "http://127.0.0.1:${SUB_PORT}/${SUB_TOKEN}" 2>/dev/null; then
+    if kill -0 "$HTTPD_PID" 2>/dev/null; then
       echo "[entrypoint] 订阅已启用：http://127.0.0.1:${SUB_PORT}/${SUB_TOKEN}（共 $(printf '%s\n' "$LINKS" | wc -l) 条）"
       if [ -n "$SUB_DOMAIN" ]; then
         echo "[entrypoint] 订阅地址： https://${SUB_DOMAIN}/${SUB_TOKEN}"
@@ -208,12 +210,9 @@ if [ -n "$SUB_PORT" ] && [ -n "$LINKS" ]; then
         echo "[entrypoint] 记得在 CF 隧道里加一条路由：${SUB_DOMAIN:-<订阅域名>} -> http://localhost:${SUB_PORT}"
       fi
     else
-      echo "[entrypoint] 警告：httpd 起来了但自检不通，订阅可能不可用"
-      cat /tmp/httpd.err 2>/dev/null || true
+      echo "[entrypoint] 警告：darkhttpd 没起来，订阅不可用（不影响代理）"
+      cat /tmp/httpd.log 2>/dev/null || true
     fi
-  else
-    echo "[entrypoint] 警告：busybox httpd 启动失败，订阅不可用（不影响代理）"
-    cat /tmp/httpd.err 2>/dev/null || true
   fi
 fi
 
