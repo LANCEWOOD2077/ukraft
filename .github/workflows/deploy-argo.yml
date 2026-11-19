@@ -99,6 +99,14 @@ on:
         description: "仅 inbound_mode=both 且给 XHTTP 单独开了一条路由时填；留空=同 argo_domain"
         required: false
         default: ""
+      sub_port:
+        description: "订阅服务端口（留空=不启用订阅）；需要 CF 隧道再加一条路由指过来"
+        required: false
+        default: "39203"
+      sub_domain:
+        description: "订阅用的域名，只用于在日志里打印订阅地址（如 sub.lancewood.de5.net）"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -202,6 +210,8 @@ jobs:
               -e ARGO_DOMAIN="$ARGO_DOMAIN" \
               -e ARGO_XHTTP_DOMAIN="${{ inputs.argo_xhttp_domain }}" \
               -e PREFERRED="$PREFERRED" \
+              -e SUB_PORT="${{ inputs.sub_port }}" \
+              -e SUB_DOMAIN="${{ inputs.sub_domain }}" \
               | tee /tmp/run.log
             rc=${PIPESTATUS[0]}
             set -e
