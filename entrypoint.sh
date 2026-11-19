@@ -17,6 +17,9 @@
 #   ARGO_XHTTP_DOMAIN         XHTTP 的隧道域名；不填就用 ARGO_DOMAIN
 #   PREFERRED                 逗号分隔的优选域名/IP，会为每个生成 H2/H3 链接
 #   DOMAIN                    直连域名（老的直连部署才需要）
+#   SUB_PORT                  >0 时在该端口用 busybox httpd 提供订阅文件（默认不启用）
+#   SUB_DOMAIN                订阅用的域名，只用于在日志里打印订阅地址
+#   SUB_TOKEN                 订阅路径里的密钥串；不填就用 UUID 派生
 #
 # 平台在外层终结 TLS 再以明文 HTTP 转进来，所以所有入站都不开 TLS、不放证书。
 set -eu
@@ -34,6 +37,9 @@ ARGO_DOMAIN="${ARGO_DOMAIN:-}"
 ARGO_XHTTP_DOMAIN_EXPLICIT="${ARGO_XHTTP_DOMAIN:-}"
 ARGO_XHTTP_DOMAIN="${ARGO_XHTTP_DOMAIN:-}"
 PREFERRED="${PREFERRED:-}"
+SUB_PORT="${SUB_PORT:-}"
+SUB_DOMAIN="${SUB_DOMAIN:-}"
+SUB_TOKEN="${SUB_TOKEN:-}"
 
 case "$INBOUND_MODE" in
   ws|xhttp|both) ;;
@@ -127,27 +133,39 @@ else
   echo "[entrypoint] 未设置 TUNNEL_TOKEN，仅直连模式"
 fi
 
-# ---- 打印链接，方便在控制台 Logs 页直接复制 ----
+# ---- 收集 + 打印链接（订阅文件也用同一份）----
 _ws="${WS_PATH#/}"
 _xp="${XHTTP_PATH#/}"
+LINKS=""
+
+# 记录一条链接：打印到日志，同时攒起来给订阅用
+add_link() {
+  echo "[entrypoint] $1"
+  if [ -n "$LINKS" ]; then
+    LINKS="${LINKS}
+$1"
+  else
+    LINKS="$1"
+  fi
+}
 
 # xhttp 链接：地址、alpn、tag
 xp_link() {
-  printf '[entrypoint] vless://%s@%s:443?encryption=none&security=tls&sni=%s&alpn=%s&fp=chrome&type=xhttp&mode=auto&host=%s&path=%%2F%s#%s\n' \
-    "$UUID" "$1" "$ARGO_XHTTP_DOMAIN" "$2" "$ARGO_XHTTP_DOMAIN" "$_xp" "$3"
+  add_link "$(printf 'vless://%s@%s:443?encryption=none&security=tls&sni=%s&alpn=%s&fp=chrome&type=xhttp&mode=auto&host=%s&path=%%2F%s#%s' \
+    "$UUID" "$1" "$ARGO_XHTTP_DOMAIN" "$2" "$ARGO_XHTTP_DOMAIN" "$_xp" "$3")"
 }
 
 if [ -n "$DOMAIN" ]; then
   if [ -n "$WS_ON" ]; then
-    echo "[entrypoint] vless://${UUID}@${DOMAIN}:443?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=ws&host=${DOMAIN}&path=%2F${_ws}#Unikraft-WS-Direct"
+    add_link "vless://${UUID}@${DOMAIN}:443?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=ws&host=${DOMAIN}&path=%2F${_ws}#Unikraft-WS-Direct"
   fi
   if [ -n "$XHTTP_ON" ]; then
-    echo "[entrypoint] vless://${UUID}@${DOMAIN}:8443?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=xhttp&host=${DOMAIN}&path=%2F${_xp}&mode=packet-up#Unikraft-XHTTP-Direct"
+    add_link "vless://${UUID}@${DOMAIN}:8443?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=xhttp&host=${DOMAIN}&path=%2F${_xp}&mode=packet-up#Unikraft-XHTTP-Direct"
   fi
 fi
 
 if [ -n "$ARGO_DOMAIN" ] && [ -n "$WS_ON" ]; then
-  echo "[entrypoint] vless://${UUID}@${ARGO_DOMAIN}:443?encryption=none&security=tls&sni=${ARGO_DOMAIN}&fp=chrome&type=ws&host=${ARGO_DOMAIN}&path=%2F${_ws}#Unikraft-Argo-WS"
+  add_link "vless://${UUID}@${ARGO_DOMAIN}:443?encryption=none&security=tls&sni=${ARGO_DOMAIN}&fp=chrome&type=ws&host=${ARGO_DOMAIN}&path=%2F${_ws}#Unikraft-Argo-WS"
 fi
 
 if [ -n "$ARGO_XHTTP_DOMAIN" ] && [ -n "$XHTTP_ON" ] \
@@ -163,10 +181,38 @@ if [ -n "$ARGO_XHTTP_DOMAIN" ] && [ -n "$XHTTP_ON" ] \
   done
 fi
 
+# ---- 可选：订阅文件（v2rayN 直接填一个 URL）----
+# 只在设置了 SUB_PORT 时启用，且必须由 CF 隧道单独路由过来，否则外部不可达。
+HTTPD_PID=""
+if [ -n "$SUB_PORT" ] && [ -n "$LINKS" ]; then
+  if [ -z "$SUB_TOKEN" ]; then
+    SUB_TOKEN=$(echo "$UUID" | tr -d '-' | cut -c1-20)
+  fi
+  mkdir -p /www
+  # v2rayN 认 base64（换行分隔的链接列表），不加换行的 base64 最稳
+  printf '%s\n' "$LINKS" | base64 | tr -d '\r\n' > "/www/${SUB_TOKEN}"
+  chmod 644 "/www/${SUB_TOKEN}"
+  busybox httpd -f -p "$SUB_PORT" -h /www 2>/dev/null &
+  HTTPD_PID=$!
+  sleep 1
+  if kill -0 "$HTTPD_PID" 2>/dev/null; then
+    echo "[entrypoint] 订阅已启用：http://127.0.0.1:${SUB_PORT}/${SUB_TOKEN}（共 $(printf '%s\n' "$LINKS" | wc -l) 条）"
+    if [ -n "$SUB_DOMAIN" ]; then
+      echo "[entrypoint] 订阅地址： https://${SUB_DOMAIN}/${SUB_TOKEN}"
+    fi
+    if [ -n "$TUNNEL_TOKEN" ]; then
+      echo "[entrypoint] 记得在 CF 隧道里加一条路由：${SUB_DOMAIN:-<订阅域名>} -> http://localhost:${SUB_PORT}"
+    fi
+  else
+    echo "[entrypoint] 警告：busybox httpd 没起来，订阅不可用（不影响代理）"
+    HTTPD_PID=""
+  fi
+fi
+
 xray run -c /etc/xray/config.json &
 XRAY_PID=$!
 
-trap 'kill "$XRAY_PID" ${CF_PID:-} 2>/dev/null; exit 0' TERM INT QUIT
+trap 'kill "$XRAY_PID" ${CF_PID:-} ${HTTPD_PID:-} 2>/dev/null; exit 0' TERM INT QUIT
 
 # 任一进程挂了就整机退出，交给 --restart always 拉起，避免"半死"状态
 while kill -0 "$XRAY_PID" 2>/dev/null; do
@@ -179,5 +225,5 @@ while kill -0 "$XRAY_PID" 2>/dev/null; do
 done
 
 echo "[entrypoint] xray 已退出，容器重启"
-kill "$CF_PID" 2>/dev/null || true
+kill ${CF_PID:-} ${HTTPD_PID:-} 2>/dev/null || true
 exit 1
